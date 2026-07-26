@@ -1526,7 +1526,8 @@ err_gpio_config_failed:
  * return:
  *     Executive outcomes. 0---succeed. negative---failed
  *******************************************************/
-static int nvt_ts_probe(struct i2c_client *client)
+static int nvt_ts_probe(struct i2c_client *client,
+		const struct i2c_device_id *id __maybe_unused)
 {
 	int ret = 0;
 #if defined(CONFIG_DRM)

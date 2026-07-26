@@ -3346,7 +3346,8 @@ static void fts_ts_fill_qts_vendor_data(struct qts_vendor_data *qts_vendor_data,
 	qts_vendor_data->qts_vendor_ops.irq_handler = fts_ts_irq_handler;
 }
 
-static int fts_ts_i2c_probe(struct i2c_client *client)
+static int fts_ts_i2c_probe(struct i2c_client *client,
+		const struct i2c_device_id *id __maybe_unused)
 {
 	int ret = 0;
 	struct fts_ts_data *ts_data = NULL;
