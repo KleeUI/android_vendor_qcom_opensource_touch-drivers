@@ -1,0 +1,6 @@
+# External build of the matching Xiaomi ST SPI input stack.
+xiaomi_input_root := $(if $(filter /%,$(src)),$(src),$(srctree)/$(src))
+subdir-ccflags-y := $(subdir-ccflags-y) -I$(xiaomi_input_root)/include/uapi -I$(xiaomi_input_root)/drivers/misc/hwid
+obj-m += drivers/misc/hwid/
+obj-m += drivers/input/touchscreen/xiaomi/
+obj-m += drivers/input/touchscreen/fts_spi/

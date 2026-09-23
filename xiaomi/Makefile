@@ -1,0 +1,9 @@
+# Cupid's Xiaomi input modules use the selected kernel's prepared output.
+KBUILD_OPTIONS += CONFIG_MI_HARDWARE_ID=m
+KBUILD_OPTIONS += CONFIG_TOUCHSCREEN_XIAOMI_TOUCHFEATURE=m
+KBUILD_OPTIONS += CONFIG_TOUCHSCREEN_ST_FTS_V521_SPI=m
+
+all: modules
+
+%:
+	$(MAKE) -C $(KERNEL_SRC) M=$(M) $@ $(KBUILD_OPTIONS)
