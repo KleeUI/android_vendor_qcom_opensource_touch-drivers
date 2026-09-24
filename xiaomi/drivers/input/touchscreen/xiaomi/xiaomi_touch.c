@@ -14,6 +14,8 @@
 #include <linux/device.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/srcu.h>
 #include <linux/of.h>
 #include <linux/soc/qcom/panel_event_notifier.h>
 #include <linux/uaccess.h>
@@ -22,7 +24,9 @@
 struct class *touch_class;
 struct device *touch_dev;
 
-static struct xiaomi_touch_interface *interfaces[TOUCH_ID_NUM];
+static struct xiaomi_touch_interface __rcu *interfaces[TOUCH_ID_NUM];
+static DEFINE_MUTEX(interfaces_lock);
+DEFINE_STATIC_SRCU(interfaces_srcu);
 
 struct oneshot_sensor_attribute {
 	struct device_attribute dev_attr;
@@ -104,9 +108,15 @@ struct touch_mode_attribute {
 int register_xiaomi_touch_client(enum touch_id touch_id,
 				 struct xiaomi_touch_interface *interface)
 {
-	if (touch_id >= TOUCH_ID_NUM || interfaces[touch_id])
+	if ((unsigned int)touch_id >= TOUCH_ID_NUM || !interface)
 		return -EINVAL;
-	interfaces[touch_id] = interface;
+	mutex_lock(&interfaces_lock);
+	if (rcu_access_pointer(interfaces[touch_id])) {
+		mutex_unlock(&interfaces_lock);
+		return -EINVAL;
+	}
+	rcu_assign_pointer(interfaces[touch_id], interface);
+	mutex_unlock(&interfaces_lock);
 
 	return 0;
 }
@@ -114,9 +124,13 @@ EXPORT_SYMBOL_GPL(register_xiaomi_touch_client);
 
 int unregister_xiaomi_touch_client(enum touch_id touch_id)
 {
-	if (touch_id >= TOUCH_ID_NUM)
+	if ((unsigned int)touch_id >= TOUCH_ID_NUM)
 		return -EINVAL;
-	interfaces[touch_id] = NULL;
+	mutex_lock(&interfaces_lock);
+	rcu_assign_pointer(interfaces[touch_id], NULL);
+	mutex_unlock(&interfaces_lock);
+	/* Unregister must run outside client callbacks and their locks. */
+	synchronize_srcu(&interfaces_srcu);
 
 	return 0;
 }
@@ -161,13 +175,16 @@ EXPORT_SYMBOL_GPL(notify_oneshot_sensor);
 static void oneshot_sensor_update_driver(enum touch_id touch_id, bool enabled,
 					 atomic_t requested_state[])
 {
-	int i;
+	int i, idx;
 	struct xiaomi_touch_interface *interface;
 
-	interface = interfaces[touch_id];
+	if ((unsigned int)touch_id >= TOUCH_ID_NUM)
+		return;
+	idx = srcu_read_lock(&interfaces_srcu);
+	interface = srcu_dereference(interfaces[touch_id], &interfaces_srcu);
 	if (!interface || !interface->get_mode_value ||
 	    !interface->set_mode_value)
-		return;
+		goto out;
 
 	for (i = 0; i < ONESHOT_SENSOR_TYPE_NUM; i++) {
 		int requested_value =
@@ -181,6 +198,8 @@ static void oneshot_sensor_update_driver(enum touch_id touch_id, bool enabled,
 						  requested_value);
 		}
 	}
+out:
+	srcu_read_unlock(&interfaces_srcu, idx);
 }
 
 static void oneshot_sensor_enable_handler(struct work_struct *work)
@@ -302,6 +321,7 @@ static const struct attribute_group oneshot_sensor_group = {
 static int touch_mode_get(enum touch_mode mode)
 {
 	struct xiaomi_touch_interface *interface;
+	int idx, value = -EFAULT;
 
 	// The following modes are not passed down to the touch driver
 	switch (mode) {
@@ -322,17 +342,20 @@ static int touch_mode_get(enum touch_mode mode)
 		break;
 	}
 
-	interface = interfaces[active_touch_id];
-	if (!interface || !interface->get_mode_value)
-		return -EFAULT;
-
-	return interface->get_mode_value(interface->private, mode);
+	idx = srcu_read_lock(&interfaces_srcu);
+	interface = srcu_dereference(interfaces[READ_ONCE(active_touch_id)],
+				     &interfaces_srcu);
+	if (interface && interface->get_mode_value)
+		value = interface->get_mode_value(interface->private, mode);
+	srcu_read_unlock(&interfaces_srcu, idx);
+	return value;
 }
 
 static int touch_mode_set(enum touch_mode mode, int value)
 {
 	struct xiaomi_touch_interface *interface;
 	enum touch_id requested_touch_id;
+	int idx, ret = -EFAULT;
 
 	// The following modes are not passed down to the touch driver
 	switch (mode) {
@@ -361,20 +384,22 @@ static int touch_mode_set(enum touch_mode mode, int value)
 				oneshot_sensor_enabled[active_touch_id]);
 			oneshot_sensor_update_driver(active_touch_id, false,
 						     NULL);
-			active_touch_id = requested_touch_id;
+			WRITE_ONCE(active_touch_id, requested_touch_id);
 		}
 		return 0;
 	default:
 		break;
 	}
 
-	interface = interfaces[active_touch_id];
-	if (!interface || !interface->set_mode_value)
-		return -EFAULT;
-
-	interface->set_mode_value(interface->private, mode, value);
-
-	return 0;
+	idx = srcu_read_lock(&interfaces_srcu);
+	interface = srcu_dereference(interfaces[READ_ONCE(active_touch_id)],
+				     &interfaces_srcu);
+	if (interface && interface->set_mode_value) {
+		interface->set_mode_value(interface->private, mode, value);
+		ret = 0;
+	}
+	srcu_read_unlock(&interfaces_srcu, idx);
+	return ret;
 }
 
 static ssize_t touch_mode_show(struct device *dev,

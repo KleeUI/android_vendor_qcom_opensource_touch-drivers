@@ -89,10 +89,6 @@
 #include <linux/time.h>
 #include <linux/time64.h>
 
-#if defined(CONFIG_DRM)
-static struct drm_panel *active_panel;
-#endif
-
 #define SUPER_RESOLUTION_FACOTR 10
 
 /**
@@ -179,13 +175,17 @@ extern void touch_irq_boost(void);
 extern void lpm_disable_for_dev(bool on, char event_dev);
 #endif
 #ifdef CONFIG_FTS_POWERSUPPLY_CB
-static int fts_write_charge_status(int status);
+static int fts_write_charge_status(struct fts_ts_info *info, int status);
 #endif
 
+#if defined(CONFIG_DRM)
+static int fts_register_panel_notifier(struct fts_ts_info *info);
+static void fts_unregister_panel_notifier(struct fts_ts_info *info);
 static void
 fts_drm_panel_notifier_callback(enum panel_event_notifier_tag tag,
 				struct panel_event_notification *notification,
 				void *client_data);
+#endif
 
 #ifdef FTS_VSYNC_MODE_ENABLE
 static int fts_set_vsync_mode(struct fts_ts_info *info, u32 fps);
@@ -1284,10 +1284,8 @@ static ssize_t stm_fts_cmd_show(struct device *dev,
 			goto END;
 		}
 #if defined(CONFIG_DRM)
-		if (active_panel && info->notifier_cookie) {
-			panel_event_notifier_unregister(info->notifier_cookie);
-			info->notifier_cookie = NULL;
-		}
+		cancel_delayed_work_sync(&info->panel_notifier_register_work);
+		fts_unregister_panel_notifier(info);
 #endif
 		switch (typeOfComand[0]) {
 			/*ITO TEST */
@@ -1513,23 +1511,8 @@ static ssize_t stm_fts_cmd_show(struct device *dev,
 		res = ERROR_OP_NOT_ALLOW;
 	}
 #if defined(CONFIG_DRM)
-	if (active_panel) {
-#ifdef CONFIG_TOUCHSCREEN_ST_FTS_V521_SPI_SECONDARY
-		info->notifier_cookie = panel_event_notifier_register(
-			PANEL_EVENT_NOTIFICATION_SECONDARY,
-			PANEL_EVENT_NOTIFIER_CLIENT_SECONDARY_TOUCH, active_panel,
-			&fts_drm_panel_notifier_callback, (void *)info);
-#else
-		info->notifier_cookie = panel_event_notifier_register(
-			PANEL_EVENT_NOTIFICATION_PRIMARY,
-			PANEL_EVENT_NOTIFIER_CLIENT_PRIMARY_TOUCH, active_panel,
-			&fts_drm_panel_notifier_callback, (void *)info);
-#endif
-		if (!info->notifier_cookie) {
-			pr_err("Failed to register for panel events\n");
-			return ERROR_BUS_R;
-		}
-	}
+	if (!READ_ONCE(info->removing))
+		schedule_delayed_work(&info->panel_notifier_register_work, 0);
 #endif
 END:
 	all_strbuff = (u8 *)kzalloc(size, GFP_KERNEL);
@@ -3098,6 +3081,8 @@ static int fts_secure_stop(struct fts_ts_info *info, bool block)
 
 	logError(1, "%s %s SECURE_STOP: block = %d\n", tag, __func__,
 		 (int)block);
+	if (!scr_info || READ_ONCE(info->removing))
+		return OK;
 	if (atomic_read(&scr_info->st_enabled) == 0) {
 		logError(1, "%s %s secure touch is already disabled\n", tag,
 			 __func__);
@@ -3167,7 +3152,7 @@ static int fts_secure_filter_interrupt(struct fts_ts_info *info)
 	struct fts_secure_info *scr_info = info->secure_info;
 
 	/*inited and enable first*/
-	if (!scr_info->secure_inited ||
+	if (READ_ONCE(info->removing) || !scr_info || !scr_info->secure_inited ||
 	    atomic_read(&scr_info->st_enabled) == 0) {
 		return -EPERM;
 	}
@@ -3213,6 +3198,9 @@ static ssize_t fts_secure_touch_enable_store(struct device *dev,
 	unsigned long value;
 	struct fts_ts_info *info = dev_get_drvdata(dev);
 	struct fts_secure_info *scr_info = info->secure_info;
+
+	if (READ_ONCE(info->removing))
+		return -ENODEV;
 
 	atomic_set(&scr_info->st_1st_complete, 0);
 	logError(1, "%s %s SECURE_TOUCH_ENABLE[W]:st_1st_complete=0\n", tag,
@@ -4417,6 +4405,10 @@ static void fts_ts_sleep_work(struct work_struct *work)
 	static char pre_id[3];
 	event_dispatch_handler_t event_handler;
 	int r;
+	if (READ_ONCE(info->removing) || !READ_ONCE(info->irq_registered)) {
+		pm_relax(info->dev);
+		return;
+	}
 	if (info->tp_pm_suspend) {
 		r = wait_for_completion_timeout(&info->pm_resume_completion,
 						msecs_to_jiffies(500));
@@ -4426,7 +4418,9 @@ static void fts_ts_sleep_work(struct work_struct *work)
 				"%s pm_resume_completion timeout, i2c is closed",
 				tag);
 			pm_relax(info->dev);
-			fts_enableInterrupt();
+			if (READ_ONCE(info->irq_registered) &&
+			    !READ_ONCE(info->removing))
+				fts_enableInterrupt();
 #ifdef CONFIG_FTS_BOOST
 			lpm_disable_for_dev(false, EVENT_INPUT);
 #endif
@@ -4484,7 +4478,8 @@ static void fts_ts_sleep_work(struct work_struct *work)
 	input_sync(info->input_dev);
 
 	pm_relax(info->dev);
-	fts_enableInterrupt();
+	if (READ_ONCE(info->irq_registered) && !READ_ONCE(info->removing))
+		fts_enableInterrupt();
 #ifdef CONFIG_FTS_BOOST
 	lpm_disable_for_dev(false, EVENT_INPUT);
 #endif
@@ -4512,6 +4507,9 @@ static irqreturn_t fts_event_handler(int irq, void *ts_info)
 	event_dispatch_handler_t event_handler;
 	static struct task_struct *touch_task = NULL;
 	struct sched_param par = { .sched_priority = MAX_RT_PRIO - 1 };
+
+	if (READ_ONCE(info->removing) || !READ_ONCE(info->irq_registered))
+		return IRQ_HANDLED;
 
 	if (touch_task == NULL) {
 		touch_task = current;
@@ -4845,7 +4843,8 @@ static void fts_fw_update_auto(struct work_struct *work)
 		container_of(work, struct delayed_work, work);
 	struct fts_ts_info *info =
 		container_of(fwu_work, struct fts_ts_info, fwu_work);
-	fts_fw_update(info, NULL, 0);
+	if (!READ_ONCE(info->removing))
+		fts_fw_update(info, NULL, 0);
 }
 #endif
 
@@ -4911,6 +4910,11 @@ static int fts_interrupt_install(struct fts_ts_info *info)
 #ifdef TOUCH_IRQ_CPU_AFFINITY
 	struct cpumask cpu_mask;
 #endif
+	if (READ_ONCE(info->removing))
+		return -ENODEV;
+	if (info->irq_registered)
+		return OK;
+
 	info->event_dispatch_table = kzalloc(
 		sizeof(event_dispatch_handler_t) * NUM_EVT_ID, GFP_KERNEL);
 
@@ -4932,16 +4936,18 @@ static int fts_interrupt_install(struct fts_ts_info *info)
 
 	/* disable interrupts in any case */
 	error = fts_disableInterrupt();
+	if (error < OK)
+		goto err_free_dispatch;
 	logError(1, "%s Interrupt Mode\n", tag);
-	if (request_threaded_irq(info->client->irq, NULL, fts_event_handler,
-				 info->board->irq_flags, FTS_TS_DRV_NAME,
-				 info)) {
+	error = request_threaded_irq(info->client->irq, NULL, fts_event_handler,
+				     info->board->irq_flags, FTS_TS_DRV_NAME,
+				     info);
+	if (error) {
 		logError(1, "%s Request irq failed\n", tag);
-		kfree(info->event_dispatch_table);
-		error = -EBUSY;
-	} else {
-		disable_irq(info->client->irq);
+		goto err_free_dispatch;
 	}
+	disable_irq(info->client->irq);
+	WRITE_ONCE(info->irq_registered, true);
 #ifdef TOUCH_IRQ_CPU_AFFINITY
 	if (info->board->support_thp) {
 		update_touch_irq_no(info->client->irq);
@@ -4949,6 +4955,11 @@ static int fts_interrupt_install(struct fts_ts_info *info)
 		irq_set_affinity_hint(info->client->irq, &cpu_mask);
 	}
 #endif
+	return error;
+
+err_free_dispatch:
+	kfree(info->event_dispatch_table);
+	info->event_dispatch_table = NULL;
 	return error;
 }
 
@@ -4958,11 +4969,21 @@ static int fts_interrupt_install(struct fts_ts_info *info)
 */
 static void fts_interrupt_uninstall(struct fts_ts_info *info)
 {
+	if (!info->irq_registered)
+		return;
+
+	WRITE_ONCE(info->irq_registered, false);
 	fts_disableInterrupt();
-
-	kfree(info->event_dispatch_table);
-
+	synchronize_irq(info->client->irq);
+	/* The sleep worker also consumes the dispatch table. */
+	cancel_work_sync(&info->sleep_work);
+#ifdef TOUCH_IRQ_CPU_AFFINITY
+	if (info->board->support_thp)
+		irq_set_affinity_hint(info->client->irq, NULL);
+#endif
 	free_irq(info->client->irq, info);
+	kfree(info->event_dispatch_table);
+	info->event_dispatch_table = NULL;
 }
 
 #ifndef I2C_INTERFACE
@@ -5215,21 +5236,32 @@ int fts_chip_powercycle(struct fts_ts_info *info)
  */
 static int fts_init_sensing(struct fts_ts_info *info)
 {
-	int error = 0;
-	error |= fts_interrupt_install(info);
-	error |= fts_mode_handler(info, 0);
-#ifdef FTS_FOD_AREA_REPORT
-	error |= setScanMode(SCAN_MODE_ACTIVE, 0x00);
-	mdelay(WAIT_AFTER_SENSEOFF);
-	error |= setScanMode(SCAN_MODE_ACTIVE, 0x01);
-#endif
-	if (error < OK) {
-		logError(1, "%s %s Init after Probe error (ERROR = %08X)\n",
-			 tag, __func__, error);
-		return error;
-	}
-	error |= fts_enableInterrupt();
+	int error;
 
+	error = fts_interrupt_install(info);
+	if (error < OK)
+		return error;
+	error = fts_mode_handler(info, 0);
+	if (error < OK)
+		goto err_uninstall_irq;
+#ifdef FTS_FOD_AREA_REPORT
+	error = setScanMode(SCAN_MODE_ACTIVE, 0x00);
+	if (error < OK)
+		goto err_uninstall_irq;
+	mdelay(WAIT_AFTER_SENSEOFF);
+	error = setScanMode(SCAN_MODE_ACTIVE, 0x01);
+	if (error < OK)
+		goto err_uninstall_irq;
+#endif
+	error = fts_enableInterrupt();
+	if (error < OK)
+		goto err_uninstall_irq;
+	return OK;
+
+err_uninstall_irq:
+	logError(1, "%s %s Init after Probe error (ERROR = %08X)\n",
+		 tag, __func__, error);
+	fts_interrupt_uninstall(info);
 	return error;
 }
 
@@ -5453,6 +5485,9 @@ static int fts_set_cur_value(void *private, enum touch_mode mode, int value)
 {
 	struct fts_ts_info *fts_info = private;
 
+	if (READ_ONCE(fts_info->removing))
+		return -ENODEV;
+
 	logError(1, "set mode: %d, value: %d", mode, value);
 	switch (mode) {
 	case TOUCH_MODE_DOUBLETAP_GESTURE:
@@ -5482,6 +5517,9 @@ static int fts_set_cur_value(void *private, enum touch_mode mode, int value)
 static int fts_get_mode_value(void *private, enum touch_mode mode)
 {
 	struct fts_ts_info *fts_info = private;
+
+	if (READ_ONCE(fts_info->removing))
+		return -ENODEV;
 
 	logError(1, "get mode: %d", mode);
 	switch (mode) {
@@ -5569,7 +5607,7 @@ static void fts_resume_work(struct work_struct *work)
 
 	info = container_of(work, struct fts_ts_info, resume_work);
 
-	if (!info->probe_ok)
+	if (!READ_ONCE(info->probe_ok) || READ_ONCE(info->removing))
 		return;
 
 	pm_stay_awake(info->dev);
@@ -5609,7 +5647,7 @@ static void fts_resume_work(struct work_struct *work)
 	msleep(12);
 #ifdef CONFIG_FTS_POWERSUPPLY_CB
 	if (info->probe_ok)
-		fts_write_charge_status(info->charging_status);
+		fts_write_charge_status(info, info->charging_status);
 #endif
 	info->sensor_sleep = false;
 
@@ -5642,7 +5680,7 @@ static void fts_suspend_work(struct work_struct *work)
 
 	info = container_of(work, struct fts_ts_info, suspend_work);
 
-	if (!info->probe_ok)
+	if (!READ_ONCE(info->probe_ok) || READ_ONCE(info->removing))
 		return;
 
 	pm_stay_awake(info->dev);
@@ -5695,7 +5733,7 @@ static void fts_fps_notify_work(struct work_struct *work)
 
 	info = container_of(work, struct fts_ts_info, fps_notify_work);
 
-	if (!info->probe_ok)
+	if (!READ_ONCE(info->probe_ok) || READ_ONCE(info->removing))
 		return;
 #ifdef FTS_VSYNC_MODE_ENABLE
 	fts_disableInterrupt();
@@ -5783,6 +5821,11 @@ fts_drm_panel_notifier_callback(enum panel_event_notifier_tag notifier_tag,
 				struct panel_event_notification *notification,
 				void *client_data)
 {
+	struct fts_ts_info *info = client_data;
+
+	if (!notification || READ_ONCE(info->removing))
+		return;
+
 	fts_handle_panel_event(notifier_tag, notification, client_data);
 #ifdef FTS_XIAOMI_TOUCHFEATURE
 	/* Keep the feature interface after the controller in notification order. */
@@ -5850,7 +5893,7 @@ static int fts_bl_state_chg_callback(struct notifier_block *nb,
 	unsigned int blank;
 	int ret;
 
-	if (val != BACKLIGHT_UPDATED)
+	if (READ_ONCE(info->removing) || val != BACKLIGHT_UPDATED)
 		return NOTIFY_OK;
 	if (data && info) {
 		blank = *(int *)(data);
@@ -5893,18 +5936,18 @@ static struct notifier_block fts_bl_noti_block = {
 };
 #endif
 #ifdef CONFIG_FTS_POWERSUPPLY_CB
-static int fts_write_charge_status(int status)
+static int fts_write_charge_status(struct fts_ts_info *info, int status)
 {
 	u8 charge_disable_cmd[3] = { 0xA2, 0x02, 0x00 };
 	u8 wired_charge_cmd[3] = { 0xA2, 0x02, 0x01 };
 	u8 wireless_charge_cmd[3] = { 0xA2, 0x02, 0x02 };
-	int res;
+	int res = 0;
 
-	if (!fts_info) {
+	if (READ_ONCE(info->removing)) {
 		logError(1, "%s %s touch no inited\n", tag, __func__);
 		return 0;
 	}
-	mutex_lock(&fts_info->charge_lock);
+	mutex_lock(&info->charge_lock);
 	logError(1, "%s %s charging_status:%d\n", tag, __func__, status);
 	if (status == NOT_CHARGING) {
 		res = fts_write_dma_safe(charge_disable_cmd,
@@ -5927,7 +5970,7 @@ static int fts_write_charge_status(int status)
 			logError(1, "%s %s: send wireless charge cmd error\n",
 				 tag, __func__);
 	}
-	mutex_unlock(&fts_info->charge_lock);
+	mutex_unlock(&info->charge_lock);
 	return res;
 }
 
@@ -5950,7 +5993,8 @@ static int fts_get_charging_status(void)
 			logError(1,
 				 "%s %s Couldn't get DC online status, rc=%d\n",
 				 tag, __func__, rc);
-		else if (val.intval == 1)
+		power_supply_put(dc_psy);
+		if (!rc && val.intval == 1)
 			return WIRELESS_CHARGING;
 	} else {
 		logError(1, "%s %s not found dc psy\n", tag, __func__);
@@ -5964,7 +6008,8 @@ static int fts_get_charging_status(void)
 				1,
 				"%s %s Couldn't get usb online status, rc=%d\n",
 				tag, __func__, rc);
-		else if (val.intval == 1)
+		power_supply_put(usb_psy);
+		if (!rc && val.intval == 1)
 			return WIRED_CHARGING;
 	} else {
 		logError(1, "%s %s not found usb psy\n", tag, __func__);
@@ -5974,27 +6019,29 @@ static int fts_get_charging_status(void)
 
 static void fts_power_supply_work(struct work_struct *work)
 {
+	struct fts_ts_info *info = container_of(
+		work, struct fts_ts_info, power_supply_work.work);
 	int charging_status;
 
-	if (!fts_info || !fts_info->probe_ok) {
+	if (READ_ONCE(info->removing) || !READ_ONCE(info->probe_ok)) {
 		logError(1, "%s %s touch is not inited\n", tag, __func__);
 		return;
 	}
 	charging_status = fts_get_charging_status();
-	if (charging_status != fts_info->charging_status ||
-	    fts_info->charging_status < 0) {
-		fts_info->charging_status = charging_status;
-		if (fts_info->tp_pm_suspend) {
+	if (charging_status != info->charging_status ||
+	    info->charging_status < 0) {
+		info->charging_status = charging_status;
+		if (info->tp_pm_suspend) {
 			logError(
 				1,
 				"%s %s tp is in suspend mode,do't write charge status\n",
 				tag, __func__);
 			return;
 		}
-		pm_stay_awake(fts_info->dev);
-		fts_write_charge_status(charging_status);
+		pm_stay_awake(info->dev);
+		fts_write_charge_status(info, charging_status);
 
-		pm_relax(fts_info->dev);
+		pm_relax(info->dev);
 	}
 }
 
@@ -6004,7 +6051,7 @@ static int fts_power_supply_event(struct notifier_block *nb,
 	struct fts_ts_info *info =
 		container_of(nb, struct fts_ts_info, power_supply_notifier);
 
-	if (!info)
+	if (READ_ONCE(info->removing))
 		return 0;
 	schedule_delayed_work(&info->power_supply_work, msecs_to_jiffies(500));
 	return 0;
@@ -6013,18 +6060,23 @@ static int fts_power_supply_event(struct notifier_block *nb,
 
 #if defined(CONFIG_DRM)
 /**
- * pointer active_panel initlized function, used to checkout panel(config)from devices
+ * Find the panel referenced by this controller's device tree node.
  * tree ,later will be passed to drm_notifyXXX function.
  * @param device node contains the panel
  * @return pointer to that panel if panel truely  exists, otherwise negative number
  */
 
-static int fts_ts_check_panel(struct device_node *np)
+static int fts_ts_check_panel(struct fts_ts_info *info)
 {
 	int i;
 	int count;
+	struct device_node *np = info->dev->of_node;
 	struct device_node *node;
 	struct drm_panel *panel;
+
+	info->panel = NULL;
+	if (!np)
+		return -ENODEV;
 
 	count = of_count_phandle_with_args(np, "panel", NULL);
 	if (count <= 0)
@@ -6032,61 +6084,86 @@ static int fts_ts_check_panel(struct device_node *np)
 
 	for (i = 0; i < count; i++) {
 		node = of_parse_phandle(np, "panel", i);
+		if (!node)
+			return -ENODEV;
 		panel = of_drm_find_panel(node);
 		of_node_put(node);
 		if (!IS_ERR(panel)) {
-			active_panel = panel;
+			info->panel = panel;
 			return 0;
-		} else {
-			active_panel = NULL;
 		}
 	}
 
 	return PTR_ERR(panel);
 }
 
+static int fts_register_panel_notifier(struct fts_ts_info *info)
+{
+	void *cookie;
+	int error = 0;
+
+	mutex_lock(&info->panel_notifier_lock);
+	if (READ_ONCE(info->removing)) {
+		error = -ENODEV;
+		goto out;
+	}
+	if (!READ_ONCE(info->probe_ok)) {
+		error = -EAGAIN;
+		goto out;
+	}
+	if (info->notifier_cookie)
+		goto out;
+	error = fts_ts_check_panel(info);
+	if (error)
+		goto out;
+
+#ifdef CONFIG_TOUCHSCREEN_ST_FTS_V521_SPI_SECONDARY
+	cookie = panel_event_notifier_register(
+			PANEL_EVENT_NOTIFICATION_SECONDARY,
+			PANEL_EVENT_NOTIFIER_CLIENT_SECONDARY_TOUCH, info->panel,
+			fts_drm_panel_notifier_callback, info);
+#else
+	cookie = panel_event_notifier_register(
+			PANEL_EVENT_NOTIFICATION_PRIMARY,
+			PANEL_EVENT_NOTIFIER_CLIENT_PRIMARY_TOUCH, info->panel,
+			fts_drm_panel_notifier_callback, info);
+#endif
+	if (IS_ERR_OR_NULL(cookie)) {
+		error = cookie ? PTR_ERR(cookie) : -ENODEV;
+		goto out;
+	}
+	info->notifier_cookie = cookie;
+	info->panel_notifier_retries = 0;
+out:
+	mutex_unlock(&info->panel_notifier_lock);
+	return error;
+}
+
+static void fts_unregister_panel_notifier(struct fts_ts_info *info)
+{
+	/* Neither the callback nor the work it flushes takes this mutex. */
+	mutex_lock(&info->panel_notifier_lock);
+	if (!IS_ERR_OR_NULL(info->notifier_cookie))
+		panel_event_notifier_unregister(info->notifier_cookie);
+	info->notifier_cookie = NULL;
+	mutex_unlock(&info->panel_notifier_lock);
+}
+
 static void fts_register_panel_notifier_work(struct work_struct *work)
 {
 	struct fts_ts_info *info = container_of(
 		work, struct fts_ts_info, panel_notifier_register_work.work);
-	struct device_node *dp = info->client->dev.of_node;
 	int error;
-	static int check_count = 0;
 
-	logError(1, "Start register panel notifier\n");
-
-	error = fts_ts_check_panel(dp);
-
-	if (!dp || !active_panel) {
-		logError(1, "Failed to register panel notifier, try again\n");
-		if (check_count++ < 5)
-			schedule_delayed_work(
-				&fts_info->panel_notifier_register_work,
-				msecs_to_jiffies(5000));
-		else {
-			logError(
-				1,
-				"Failed to register panel notifier, not try\n");
-		}
+	if (READ_ONCE(info->removing))
 		return;
-	}
-
-	if (active_panel) {
-#ifdef CONFIG_TOUCHSCREEN_ST_FTS_V521_SPI_SECONDARY
-		fts_info->notifier_cookie = panel_event_notifier_register(
-			PANEL_EVENT_NOTIFICATION_SECONDARY,
-			PANEL_EVENT_NOTIFIER_CLIENT_SECONDARY_TOUCH, active_panel,
-			&fts_drm_panel_notifier_callback, (void *)fts_info);
-#else
-		fts_info->notifier_cookie = panel_event_notifier_register(
-			PANEL_EVENT_NOTIFICATION_PRIMARY,
-			PANEL_EVENT_NOTIFIER_CLIENT_PRIMARY_TOUCH, active_panel,
-			&fts_drm_panel_notifier_callback, (void *)fts_info);
-#endif
-		if (!fts_info->notifier_cookie) {
-			logError(1, "Failed to register for panel events\n");
-		}
-	}
+	error = fts_register_panel_notifier(info);
+	if (!error)
+		return;
+	logError(1, "Panel notifier registration failed: %d\n", error);
+	if (!READ_ONCE(info->removing) && info->panel_notifier_retries++ < 5)
+		schedule_delayed_work(&info->panel_notifier_register_work,
+				      msecs_to_jiffies(5000));
 }
 #endif
 
@@ -6112,6 +6189,7 @@ static int fts_get_reg(struct fts_ts_info *info, bool get)
 			logError(1, "%s %s: Failed to get pullup regulator\n",
 				 tag, __func__);
 			retval = PTR_ERR(info->vdd_reg);
+			info->vdd_reg = NULL;
 			goto regulator_put;
 		}
 	}
@@ -6123,18 +6201,19 @@ static int fts_get_reg(struct fts_ts_info *info, bool get)
 				 "%s %s: Failed to get bus power regulator\n",
 				 tag, __func__);
 			retval = PTR_ERR(info->avdd_reg);
+			info->avdd_reg = NULL;
 			goto regulator_put;
 		}
 	}
 	return OK;
 
 regulator_put:
-	if (info->vdd_reg) {
+	if (!IS_ERR_OR_NULL(info->vdd_reg)) {
 		regulator_put(info->vdd_reg);
 		info->vdd_reg = NULL;
 	}
 
-	if (info->avdd_reg) {
+	if (!IS_ERR_OR_NULL(info->avdd_reg)) {
 		regulator_put(info->avdd_reg);
 		info->avdd_reg = NULL;
 	}
@@ -6211,13 +6290,14 @@ exit:
  * @param state initial value (if the direction is in, this parameter is ignored)
  * return error code
  */
-static int fts_gpio_setup(int gpio, bool config, int dir, int state)
+static int fts_gpio_setup(int gpio, bool *requested, bool config,
+			  int dir, int state)
 {
 	int retval = 0;
 	unsigned char buf[16];
 
 	if (config) {
-		if (!fts_info->gpio_has_request) {
+		if (!*requested) {
 			snprintf(buf, 16, "fts_gpio_%u\n", gpio);
 			retval = gpio_request(gpio, buf);
 			if (retval) {
@@ -6227,6 +6307,7 @@ static int fts_gpio_setup(int gpio, bool config, int dir, int state)
 					tag, __func__, gpio, retval);
 				return retval;
 			}
+			*requested = true;
 		}
 
 		if (dir == 0)
@@ -6238,8 +6319,9 @@ static int fts_gpio_setup(int gpio, bool config, int dir, int state)
 				 tag, __func__, gpio);
 			return retval;
 		}
-	} else {
+	} else if (*requested) {
 		gpio_free(gpio);
+		*requested = false;
 	}
 
 	return retval;
@@ -6254,8 +6336,8 @@ static int fts_set_gpio(struct fts_ts_info *info, bool alway_output_low)
 	int retval;
 	struct fts_hw_platform_data *bdata = info->board;
 
-	retval = fts_gpio_setup(bdata->irq_gpio, true, alway_output_low ? 1 : 0,
-				0);
+	retval = fts_gpio_setup(bdata->irq_gpio, &info->irq_gpio_requested,
+				true, alway_output_low ? 1 : 0, 0);
 	if (retval < 0) {
 		logError(1, "%s %s: Failed to configure irq GPIO\n", tag,
 			 __func__);
@@ -6263,7 +6345,8 @@ static int fts_set_gpio(struct fts_ts_info *info, bool alway_output_low)
 	}
 
 	if (bdata->reset_gpio >= 0) {
-		retval = fts_gpio_setup(bdata->reset_gpio, true, 1,
+		retval = fts_gpio_setup(bdata->reset_gpio,
+					&info->reset_gpio_requested, true, 1,
 					alway_output_low ? 0 : 1);
 		if (retval < 0) {
 			logError(1, "%s %s: Failed to configure reset GPIO\n",
@@ -6282,9 +6365,11 @@ static int fts_set_gpio(struct fts_ts_info *info, bool alway_output_low)
 	return OK;
 
 err_gpio_reset:
-	fts_gpio_setup(bdata->irq_gpio, false, 0, 0);
-	bdata->reset_gpio = GPIO_NOT_DEFINED;
 err_gpio_irq:
+	fts_gpio_setup(bdata->reset_gpio, &info->reset_gpio_requested,
+		       false, 0, 0);
+	fts_gpio_setup(bdata->irq_gpio, &info->irq_gpio_requested,
+		       false, 0, 0);
 	return retval;
 }
 
@@ -6295,7 +6380,7 @@ static int fts_pinctrl_init(struct fts_ts_info *info)
 	info->ts_pinctrl = devm_pinctrl_get(info->dev);
 
 	if (IS_ERR_OR_NULL(info->ts_pinctrl)) {
-		retval = PTR_ERR(info->ts_pinctrl);
+		retval = info->ts_pinctrl ? PTR_ERR(info->ts_pinctrl) : -ENODEV;
 		dev_err(info->dev, "Target does not use pinctrl %d\n", retval);
 		goto err_pinctrl_get;
 	}
@@ -6304,7 +6389,8 @@ static int fts_pinctrl_init(struct fts_ts_info *info)
 		pinctrl_lookup_state(info->ts_pinctrl, PINCTRL_STATE_ACTIVE);
 
 	if (IS_ERR_OR_NULL(info->pinctrl_state_active)) {
-		retval = PTR_ERR(info->pinctrl_state_active);
+		retval = info->pinctrl_state_active ?
+			PTR_ERR(info->pinctrl_state_active) : -ENODEV;
 		dev_err(info->dev, "Can not lookup %s pinstate %d\n",
 			PINCTRL_STATE_ACTIVE, retval);
 		goto err_pinctrl_lookup;
@@ -6314,7 +6400,8 @@ static int fts_pinctrl_init(struct fts_ts_info *info)
 		pinctrl_lookup_state(info->ts_pinctrl, PINCTRL_STATE_SUSPEND);
 
 	if (IS_ERR_OR_NULL(info->pinctrl_state_suspend)) {
-		retval = PTR_ERR(info->pinctrl_state_suspend);
+		retval = info->pinctrl_state_suspend ?
+			PTR_ERR(info->pinctrl_state_suspend) : -ENODEV;
 		dev_dbg(info->dev, "Can not lookup %s pinstate %d\n",
 			PINCTRL_STATE_SUSPEND, retval);
 		goto err_pinctrl_lookup;
@@ -6532,6 +6619,9 @@ static void fts_switch_mode_work(struct work_struct *work)
 	u8 gesture_type = fts_need_enter_lp_mode();
 	u8 gesture_cmd[6] = { 0xA2, 0x03, 0x00, 0x00, 0x00, gesture_type };
 	int res = 0;
+
+	if (READ_ONCE(info->removing))
+		return;
 
 	if (info->resume_bit) {
 		logError(
@@ -6904,7 +6994,7 @@ static int fts_pm_suspend(struct device *dev)
 	struct fts_ts_info *info = dev_get_drvdata(dev);
 	logError(1, "%s %s\n", tag, __func__);
 
-	if (!info) {
+	if (!info || READ_ONCE(info->removing)) {
 		logError(1, "%s fts_pm_suspend failed, return\n", tag);
 		return 0;
 	}
@@ -6925,6 +7015,9 @@ static int fts_pm_resume(struct device *dev)
 {
 	struct fts_ts_info *info = dev_get_drvdata(dev);
 	logError(1, "%s %s\n", tag, __func__);
+
+	if (!info || READ_ONCE(info->removing))
+		return 0;
 
 	if (device_may_wakeup(dev) &&
 	    (info->gesture_enabled || fts_need_enter_lp_mode())) {
@@ -7011,6 +7104,11 @@ static ssize_t tpdbg_write(struct file *file, const char __user *buf,
 	if (!cmd)
 		return -ENOMEM;
 
+	if (READ_ONCE(info->removing)) {
+		ret = -ENODEV;
+		goto out;
+	}
+
 	if (copy_from_user(cmd, buf, size)) {
 		ret = -EFAULT;
 		goto out;
@@ -7059,7 +7157,7 @@ int fts_secure_init(struct fts_ts_info *info)
 {
 	int ret;
 	struct fts_secure_info *scr_info =
-		kmalloc(sizeof(*scr_info), GFP_KERNEL);
+		kzalloc(sizeof(*scr_info), GFP_KERNEL);
 	if (!scr_info) {
 		logError(1, "%s %s alloc fts_secure_info failed\n", tag,
 			 __func__);
@@ -7102,6 +7200,7 @@ int fts_secure_init(struct fts_ts_info *info)
 	return 0;
 
 err:
+	sysfs_remove_file(&info->dev->kobj, &dev_attr_secure_touch_enable.attr);
 	kfree(scr_info);
 	info->secure_info = NULL;
 	return ret;
@@ -7114,9 +7213,127 @@ void fts_secure_remove(struct fts_ts_info *info)
 	sysfs_remove_file(&info->dev->kobj, &dev_attr_secure_touch_enable.attr);
 	sysfs_remove_file(&info->dev->kobj, &dev_attr_secure_touch.attr);
 	kfree(scr_info);
+	info->secure_info = NULL;
 }
 
 #endif
+
+/* Stop publishers before draining work; keep input/bus state alive until then. */
+static void fts_release_resources(struct fts_ts_info *info)
+{
+	WRITE_ONCE(info->removing, true);
+	WRITE_ONCE(info->probe_ok, false);
+#ifdef CONFIG_SECURE_TOUCH
+	if (info->secure_info) {
+		atomic_set(&info->secure_info->st_enabled, 0);
+		complete_all(&info->secure_info->st_irq_processed);
+		complete_all(&info->secure_info->st_powerdown);
+		sysfs_remove_file(&info->dev->kobj,
+				  &dev_attr_secure_touch_enable.attr);
+		sysfs_remove_file(&info->dev->kobj,
+				  &dev_attr_secure_touch.attr);
+		/* An already-running writer may have reinitialized either wait. */
+		atomic_set(&info->secure_info->st_enabled, 0);
+		complete_all(&info->secure_info->st_irq_processed);
+		complete_all(&info->secure_info->st_powerdown);
+	}
+#endif
+	if (info->sysfs_registered)
+		sysfs_remove_group(&info->dev->kobj, &info->attrs);
+	if (info->proc_registered)
+		fts_proc_remove();
+	proc_remove(info->tp_selftest_proc);
+	proc_remove(info->tp_lockdown_info_proc);
+	proc_remove(info->tp_data_dump_proc);
+	proc_remove(info->tp_fw_version_proc);
+#ifdef FTS_DEBUG_FS
+	debugfs_remove_recursive(info->debugfs);
+#endif
+	if (info->fts_touch_dev)
+		device_destroy(info->fts_tp_class, DCHIP_ID_0);
+	if (info->fts_tp_class)
+		class_destroy(info->fts_tp_class);
+
+#if defined(CONFIG_DRM)
+	cancel_delayed_work_sync(&info->panel_notifier_register_work);
+	/* Framework unregister waits for callbacks already in flight. */
+	fts_unregister_panel_notifier(info);
+#endif
+#ifdef FTS_XIAOMI_TOUCHFEATURE
+	if (info->xiaomi_touch_registered) {
+#ifdef CONFIG_TOUCHSCREEN_ST_FTS_V521_SPI_SECONDARY
+		unregister_xiaomi_touch_client(TOUCH_ID_SECONDARY);
+#else
+		unregister_xiaomi_touch_client(TOUCH_ID_PRIMARY);
+#endif
+	}
+#endif
+#ifdef CONFIG_FTS_POWERSUPPLY_CB
+	if (info->power_supply_registered)
+		power_supply_unreg_notifier(&info->power_supply_notifier);
+	cancel_delayed_work_sync(&info->power_supply_work);
+#endif
+#ifdef CONFIG_FTS_BL_CB
+	if (info->bl_registered)
+		backlight_unregister_notifier(&info->bl_notifier);
+#endif
+#if defined(FTS_FW_UPDATE) && !defined(FW_UPDATE_ON_PROBE)
+	/* Firmware work can install the IRQ, so drain it before uninstall. */
+	cancel_delayed_work_sync(&info->fwu_work);
+#endif
+#ifdef FTS_XIAOMI_TOUCHFEATURE
+	cancel_work_sync(&info->switch_mode_work);
+#endif
+	cancel_work_sync(&info->resume_work);
+	cancel_work_sync(&info->suspend_work);
+	cancel_work_sync(&info->fps_notify_work);
+	cancel_delayed_work_sync(&info->thp_signal_work);
+	fts_interrupt_uninstall(info);
+	cancel_work_sync(&info->sleep_work);
+	if (info->event_wq)
+		destroy_workqueue(info->event_wq);
+	if (info->fps_wq)
+		destroy_workqueue(info->fps_wq);
+	if (info->irq_wq)
+		destroy_workqueue(info->irq_wq);
+#if defined(FTS_FW_UPDATE) && !defined(FW_UPDATE_ON_PROBE)
+	if (info->fwu_workqueue)
+		destroy_workqueue(info->fwu_workqueue);
+#endif
+	if (info->input_registered)
+		input_unregister_device(info->input_dev);
+	else if (info->input_dev)
+		input_free_device(info->input_dev);
+#ifdef CONFIG_SECURE_TOUCH
+	kfree(info->secure_info);
+#endif
+#ifdef CONFIG_I2C_BY_DMA
+	if (info->dma_buf) {
+		kfree(info->dma_buf->rdBuf);
+		kfree(info->dma_buf->wrBuf);
+		kfree(info->dma_buf);
+	}
+#endif
+	if (info->wakeup_enabled) {
+		pm_relax(info->dev);
+		device_init_wakeup(info->dev, false);
+	}
+	if (info->regulators_enabled)
+		fts_enable_reg(info, false);
+	fts_get_reg(info, false);
+	if (info->ts_pinctrl)
+		devm_pinctrl_put(info->ts_pinctrl);
+	if (info->board) {
+		fts_gpio_setup(info->board->irq_gpio,
+			       &info->irq_gpio_requested, false, 0, 0);
+		fts_gpio_setup(info->board->reset_gpio,
+			       &info->reset_gpio_requested, false, 0, 0);
+	}
+	dev_set_drvdata(info->dev, NULL);
+	if (fts_info == info)
+		WRITE_ONCE(fts_info, NULL);
+	kfree(info);
+}
 
 /**
  * Probe function, called when the driver it is matched with a device with the same name compatible name
@@ -7135,7 +7352,6 @@ static int fts_probe(struct spi_device *client)
 	int error = 0;
 	struct device_node *dp = client->dev.of_node;
 	int retval;
-	int skip_5_1 = 0;
 	u16 bus_type;
 	int gpio_119;
 	uint32_t hw_project;
@@ -7199,6 +7415,30 @@ static int fts_probe(struct spi_device *client)
 	info->client = client;
 	info->dev = &info->client->dev;
 	dev_set_drvdata(info->dev, info);
+	/* Initialize every cancellable item before the first failure exit. */
+	mutex_init(&info->panel_notifier_lock);
+	mutex_init(&info->fod_mutex);
+	mutex_init(&info->charge_lock);
+	INIT_WORK(&info->resume_work, fts_resume_work);
+	INIT_WORK(&info->suspend_work, fts_suspend_work);
+	INIT_WORK(&info->sleep_work, fts_ts_sleep_work);
+	INIT_WORK(&info->fps_notify_work, fts_fps_notify_work);
+	INIT_DELAYED_WORK(&info->thp_signal_work, fts_thp_signal_work);
+	init_completion(&info->tp_reset_completion);
+	init_completion(&info->pm_resume_completion);
+#if defined(CONFIG_DRM)
+	INIT_DELAYED_WORK(&info->panel_notifier_register_work,
+			  fts_register_panel_notifier_work);
+#endif
+#ifdef CONFIG_FTS_POWERSUPPLY_CB
+	INIT_DELAYED_WORK(&info->power_supply_work, fts_power_supply_work);
+#endif
+#if defined(FTS_FW_UPDATE) && !defined(FW_UPDATE_ON_PROBE)
+	INIT_DELAYED_WORK(&info->fwu_work, fts_fw_update_auto);
+#endif
+#ifdef FTS_XIAOMI_TOUCHFEATURE
+	INIT_WORK(&info->switch_mode_work, fts_switch_mode_work);
+#endif
 
 	if (dp) {
 		info->board = devm_kzalloc(&client->dev,
@@ -7210,34 +7450,13 @@ static int fts_probe(struct spi_device *client)
 			error = -ENOMEM;
 			goto ProbeErrorExit_1;
 		}
-		parse_dt(&client->dev, info->board);
-	}
-#if defined(CONFIG_DRM)
-	INIT_DELAYED_WORK(&info->panel_notifier_register_work,
-			  fts_register_panel_notifier_work);
-	error = fts_ts_check_panel(dp);
-	if (!active_panel) {
-		logError(1, "%s Can't find panel\n", tag);
-		/*goto ProbeErrorExit_1;*/
-		schedule_delayed_work(&info->panel_notifier_register_work,
-				      msecs_to_jiffies(5000));
+		error = parse_dt(&client->dev, info->board);
+		if (error)
+			goto ProbeErrorExit_1;
 	} else {
-#ifdef CONFIG_TOUCHSCREEN_ST_FTS_V521_SPI_SECONDARY
-		info->notifier_cookie = panel_event_notifier_register(
-			PANEL_EVENT_NOTIFICATION_SECONDARY,
-			PANEL_EVENT_NOTIFIER_CLIENT_SECONDARY_TOUCH, active_panel,
-			&fts_drm_panel_notifier_callback, (void *)info);
-#else
-		info->notifier_cookie = panel_event_notifier_register(
-			PANEL_EVENT_NOTIFICATION_PRIMARY,
-			PANEL_EVENT_NOTIFIER_CLIENT_PRIMARY_TOUCH, active_panel,
-			&fts_drm_panel_notifier_callback, (void *)info);
-#endif
-		if (!info->notifier_cookie) {
-			logError(1, "Failed to register for panel events\n");
-		}
+		error = -ENODEV;
+		goto ProbeErrorExit_1;
 	}
-#endif
 	logError(0, "%s SET GPIOS: \n", tag);
 	info->gpio_has_request = false;
 	retval = fts_set_gpio(info, true);
@@ -7258,6 +7477,7 @@ static int fts_probe(struct spi_device *client)
 			dev_err(&client->dev,
 				"%s: Failed to select %s pinstate %d\n",
 				__func__, PINCTRL_STATE_ACTIVE, error);
+			goto ProbeErrorExit_1;
 		}
 	} else {
 		dev_err(&client->dev, "%s: Failed to init pinctrl\n", __func__);
@@ -7280,6 +7500,7 @@ static int fts_probe(struct spi_device *client)
 		error = retval;
 		goto ProbeErrorExit_3;
 	}
+	info->regulators_enabled = true;
 
 	mdelay(3);
 	retval = fts_set_gpio(info, false);
@@ -7291,6 +7512,10 @@ static int fts_probe(struct spi_device *client)
 	}
 
 	info->client->irq = gpio_to_irq(info->board->irq_gpio);
+	if (info->client->irq < 0) {
+		error = info->client->irq;
+		goto ProbeErrorExit_4;
+	}
 	logError(1, "%s gpio_num:%d, irq:%d\n", tag, info->board->irq_gpio,
 		 info->client->irq);
 
@@ -7321,14 +7546,6 @@ static int fts_probe(struct spi_device *client)
 		goto ProbeErrorExit_4;
 	}
 
-	mutex_init(&info->fod_mutex);
-	INIT_WORK(&info->resume_work, fts_resume_work);
-	INIT_WORK(&info->suspend_work, fts_suspend_work);
-	INIT_WORK(&info->sleep_work, fts_ts_sleep_work);
-	INIT_WORK(&info->fps_notify_work, fts_fps_notify_work);
-	INIT_DELAYED_WORK(&info->thp_signal_work, fts_thp_signal_work);
-	init_completion(&info->tp_reset_completion);
-
 	logError(0, "%s SET Input Device Property: \n", tag);
 	info->dev = &info->client->dev;
 	info->input_dev = input_allocate_device();
@@ -7355,7 +7572,9 @@ static int fts_probe(struct spi_device *client)
 	__set_bit(BTN_TOOL_FINGER, info->input_dev->keybit);
 	/*__set_bit(BTN_TOOL_PEN, info->input_dev->keybit);*/
 
-	input_mt_init_slots(info->input_dev, TOUCH_ID_MAX, INPUT_MT_DIRECT);
+	error = input_mt_init_slots(info->input_dev, TOUCH_ID_MAX, INPUT_MT_DIRECT);
+	if (error)
+		goto ProbeErrorExit_5_1;
 
 	/*input_mt_init_slots(info->input_dev, TOUCH_ID_MAX); */
 
@@ -7434,7 +7653,7 @@ static int fts_probe(struct spi_device *client)
 		goto ProbeErrorExit_5_1;
 	}
 
-	skip_5_1 = 1;
+	info->input_registered = true;
 	/* track slots */
 	info->touch_id = 0;
 	info->temp_touch_id = 0;
@@ -7455,58 +7674,51 @@ static int fts_probe(struct spi_device *client)
 	info->lockdown_is_ok = false;
 	info->notifier = fts_noti_block;
 #ifdef CONFIG_FTS_POWERSUPPLY_CB
-	INIT_DELAYED_WORK(&info->power_supply_work, fts_power_supply_work);
 	info->charging_status = -1;
 	info->power_supply_notifier.notifier_call = fts_power_supply_event;
-	power_supply_reg_notifier(&info->power_supply_notifier);
 #endif
-	mutex_init(&info->charge_lock);
 #ifdef CONFIG_FTS_BL_CB
 	info->bl_notifier = fts_bl_noti_block;
 #endif
-	logError(0, "%s Init Core Lib: \n", tag);
-	initCore(info);
-	/* init hardware device */
-	logError(0, "%s Device Initialization: \n", tag);
-	error = fts_init(info);
-	if (error < OK) {
-		logError(1, "%s Cannot initialize the device ERROR %08X\n", tag,
-			 error);
-		error = -ENODEV;
-		goto ProbeErrorExit_6;
-	}
-	info->vsync_fps = 120;
-#ifdef CONFIG_SECURE_TOUCH
-	logError(1, "%s %s create secure touch file...\n", tag, __func__);
-	error = fts_secure_init(info);
-	if (error < 0) {
-		logError(1, "%s %s init secure touch failed\n", tag, __func__);
-		goto ProbeErrorExit_7;
-	}
-	logError(1, "%s %s create secure touch file successful\n", tag,
-		 __func__);
-	fts_secure_stop(info, 1);
-#endif
-
 #ifdef CONFIG_I2C_BY_DMA
 	/*dma buf init*/
 	info->dma_buf = (struct fts_dma_buf *)kzalloc(sizeof(*info->dma_buf),
 						      GFP_KERNEL);
 	if (!info->dma_buf) {
 		logError(1, "%s %s:Error alloc mem failed!", tag, __func__);
+		error = -ENOMEM;
 		goto ProbeErrorExit_7;
 	}
 	mutex_init(&info->dma_buf->dmaBufLock);
 	info->dma_buf->rdBuf = kzalloc(PAGE_SIZE, GFP_KERNEL);
 	if (!info->dma_buf->rdBuf) {
 		logError(1, "%s %s:Error alloc mem failed!", tag, __func__);
+		error = -ENOMEM;
 		goto ProbeErrorExit_7;
 	}
 	info->dma_buf->wrBuf = kzalloc(PAGE_SIZE, GFP_KERNEL);
 	if (!info->dma_buf->wrBuf) {
 		logError(1, "%s %s:Error alloc mem failed!", tag, __func__);
+		error = -ENOMEM;
 		goto ProbeErrorExit_7;
 	}
+#endif
+	logError(0, "%s Init Core Lib: \n", tag);
+	error = initCore(info);
+	if (error < OK)
+		goto ProbeErrorExit_6;
+	/* Allocate the transport buffers before the first hardware access. */
+	error = fts_init(info);
+	if (error < OK) {
+		error = -ENODEV;
+		goto ProbeErrorExit_6;
+	}
+	info->vsync_fps = 120;
+#ifdef CONFIG_SECURE_TOUCH
+	error = fts_secure_init(info);
+	if (error < 0)
+		goto ProbeErrorExit_7;
+	fts_secure_stop(info, 1);
 #endif
 	error = fts_get_lockdown_info(info->lockdown_info, info);
 
@@ -7524,6 +7736,10 @@ static int fts_probe(struct spi_device *client)
 	}
 	info->tp_selftest_proc =
 		proc_create(FTS_TP_SELFTEST_NAME, 0644, NULL, &fts_selftest_ops);
+	if (!info->tp_selftest_proc) {
+		error = -ENOMEM;
+		goto ProbeErrorExit_7;
+	}
 
 #ifdef FTS_FW_UPDATE
 #ifdef FW_UPDATE_ON_PROBE
@@ -7542,9 +7758,9 @@ static int fts_probe(struct spi_device *client)
 		FTS_FWU_QUEUE_NAME, WQ_UNBOUND | WQ_HIGHPRI | WQ_CPU_INTENSIVE, 1);
 	if (!info->fwu_workqueue) {
 		logError(1, "%s ERROR: Cannot create fwu work thread\n", tag);
+		error = -ENOMEM;
 		goto ProbeErrorExit_7;
 	}
-	INIT_DELAYED_WORK(&info->fwu_work, fts_fw_update_auto);
 #endif
 #else
 	error = fts_init_sensing(info);
@@ -7553,6 +7769,7 @@ static int fts_probe(struct spi_device *client)
 			1,
 			"%s Cannot initialize the hardware device ERROR %08X\n",
 			tag, error);
+		goto ProbeErrorExit_7;
 	}
 #endif
 	info->sensor_scan = true;
@@ -7566,33 +7783,40 @@ static int fts_probe(struct spi_device *client)
 		error = -ENODEV;
 		goto ProbeErrorExit_7;
 	}
+	info->sysfs_registered = true;
 
 	error = fts_proc_init();
-	if (error < OK)
+	if (error < OK) {
 		logError(1, "%s Error: can not create /proc file! \n", tag);
-
-	device_init_wakeup(&client->dev, 1);
-	init_completion(&info->pm_resume_completion);
-#ifdef CONFIG_FTS_BL_CB
-	if (backlight_register_notifier(&info->bl_notifier) < 0) {
-		logError(1, "%s register bl_notifier failed!\n", tag);
+		goto ProbeErrorExit_7;
 	}
-#endif
+	info->proc_registered = true;
+
+	error = device_init_wakeup(&client->dev, true);
+	if (error)
+		goto ProbeErrorExit_7;
+	info->wakeup_enabled = true;
 
 #ifdef FTS_DEBUG_FS
 	info->debugfs = debugfs_create_dir(FTS_DEBUGFS_DIR_NAME, NULL);
-	if (info->debugfs) {
+	if (!IS_ERR_OR_NULL(info->debugfs)) {
 		debugfs_create_file("switch_state", 0660, info->debugfs, info,
 				    &tpdbg_operations);
 	}
 #endif
 
-	if (info->fts_tp_class == NULL)
-		info->fts_tp_class = class_create(THIS_MODULE, "touch_fts");
+	info->fts_tp_class = class_create(THIS_MODULE, "touch_fts");
+	if (IS_ERR(info->fts_tp_class)) {
+		error = PTR_ERR(info->fts_tp_class);
+		info->fts_tp_class = NULL;
+		goto ProbeErrorExit_8;
+	}
 	info->fts_touch_dev = device_create(info->fts_tp_class, NULL,
 					    DCHIP_ID_0, info, FTS_TOUCH_DEV_NAME);
 
 	if (IS_ERR(info->fts_touch_dev)) {
+		error = PTR_ERR(info->fts_touch_dev);
+		info->fts_touch_dev = NULL;
 		logError(1,
 			 "%s ERROR: Failed to create device for the sysfs!\n",
 			 tag);
@@ -7607,6 +7831,7 @@ static int fts_probe(struct spi_device *client)
 			1,
 			"%s Error: Failed to create ellipse_data sysfs group!\n",
 			tag);
+		goto ProbeErrorExit_8;
 	}
 	info->tp_lockdown_info_proc = proc_create(FTS_TP_LOCKDOWN_INFO_NAME, 0444,
 						  NULL, &fts_lockdown_info_ops);
@@ -7614,101 +7839,70 @@ static int fts_probe(struct spi_device *client)
 		proc_create(FTS_TP_DATA_DUMP_NAME, 0444, NULL, &fts_datadump_ops);
 	info->tp_fw_version_proc =
 		proc_create(FTS_TP_FW_VERSION_NAME, 0444, NULL, &fts_fw_version_ops);
+	if (!info->tp_lockdown_info_proc || !info->tp_data_dump_proc ||
+	    !info->tp_fw_version_proc) {
+		error = -ENOMEM;
+		goto ProbeErrorExit_8;
+	}
 
 #ifdef FTS_XIAOMI_TOUCHFEATURE
-	INIT_WORK(&info->switch_mode_work, fts_switch_mode_work);
-
 	info->xiaomi_touch.set_mode_value = fts_set_cur_value;
 	info->xiaomi_touch.get_mode_value = fts_get_mode_value;
 	info->xiaomi_touch.private = info;
-#ifdef CONFIG_TOUCHSCREEN_ST_FTS_V521_SPI_SECONDARY
-	register_xiaomi_touch_client(TOUCH_ID_SECONDARY, &info->xiaomi_touch);
-#else
-	register_xiaomi_touch_client(TOUCH_ID_PRIMARY, &info->xiaomi_touch);
-#endif
 #endif
 
-	fts_info->enable_touch_delta = 1;
-	fts_info->enable_thp_fw = fts_info->board->support_thp_fw;
-	fts_info->enable_touch_raw = fts_info->board->support_thp;
-	if (!fts_info->board->support_thp && fts_info->board->support_thp_fw) {
+	info->enable_touch_delta = 1;
+	info->enable_thp_fw = info->board->support_thp_fw;
+	info->enable_touch_raw = info->board->support_thp;
+	if (!info->board->support_thp && info->board->support_thp_fw) {
 		fts_enable_thp_onoff(0);
 	}
 
-#ifndef FW_UPDATE_ON_PROBE
+	/* Publish callbacks only after all callback-visible state is ready. */
+	WRITE_ONCE(info->probe_ok, true);
+#ifdef FTS_XIAOMI_TOUCHFEATURE
+#ifdef CONFIG_TOUCHSCREEN_ST_FTS_V521_SPI_SECONDARY
+	error = register_xiaomi_touch_client(TOUCH_ID_SECONDARY, &info->xiaomi_touch);
+#else
+	error = register_xiaomi_touch_client(TOUCH_ID_PRIMARY, &info->xiaomi_touch);
+#endif
+	if (error)
+		goto ProbeErrorExit_8;
+	info->xiaomi_touch_registered = true;
+#endif
+#ifdef CONFIG_FTS_POWERSUPPLY_CB
+	error = power_supply_reg_notifier(&info->power_supply_notifier);
+	if (error)
+		goto ProbeErrorExit_8;
+	info->power_supply_registered = true;
+#endif
+#ifdef CONFIG_FTS_BL_CB
+	error = backlight_register_notifier(&info->bl_notifier);
+	if (error)
+		goto ProbeErrorExit_8;
+	info->bl_registered = true;
+#endif
+#if defined(CONFIG_DRM)
+	schedule_delayed_work(&info->panel_notifier_register_work, 0);
+#endif
+#if defined(FTS_FW_UPDATE) && !defined(FW_UPDATE_ON_PROBE)
 	queue_delayed_work(info->fwu_workqueue, &info->fwu_work,
 			   msecs_to_jiffies(EXP_FN_WORK_DELAY_MS));
 #endif
-	info->probe_ok = true;
 
 	logError(1, "%s Probe Finished! \n", tag);
 	return OK;
 ProbeErrorExit_8:
-	fts_disableInterrupt();
-	device_destroy(info->fts_tp_class, DCHIP_ID_0);
-	if (info->tp_lockdown_info_proc)
-		remove_proc_entry(FTS_TP_LOCKDOWN_INFO_NAME, NULL);
-	if (info->tp_data_dump_proc)
-		remove_proc_entry(FTS_TP_DATA_DUMP_NAME, NULL);
-	if (info->tp_fw_version_proc)
-		remove_proc_entry(FTS_TP_FW_VERSION_NAME, NULL);
-	info->tp_lockdown_info_proc = NULL;
-	info->tp_data_dump_proc = NULL;
-	info->tp_fw_version_proc = NULL;
-/*
-	class_destroy(info->fts_tp_class);
-	info->fts_tp_class = NULL;
-*/
 ProbeErrorExit_7:
-	if (info->tp_selftest_proc)
-		remove_proc_entry(FTS_TP_SELFTEST_NAME, NULL);
-	info->tp_selftest_proc = NULL;
-#ifdef CONFIG_SECURE_TOUCH
-	fts_secure_remove(info);
-#endif
-#ifdef CONFIG_I2C_BY_DMA
-	if (info->dma_buf)
-		kfree(info->dma_buf);
-	if (info->dma_buf->rdBuf)
-		kfree(info->dma_buf->rdBuf);
-	if (info->dma_buf->wrBuf)
-		kfree(info->dma_buf->wrBuf);
-#endif
 ProbeErrorExit_6:
-#if defined(CONFIG_DRM)
-	cancel_delayed_work_sync(&info->panel_notifier_register_work);
-	if (active_panel && info->notifier_cookie)
-		panel_event_notifier_unregister(info->notifier_cookie);
-#endif
-	input_unregister_device(info->input_dev);
-#ifdef CONFIG_FTS_POWERSUPPLY_CB
-	power_supply_unreg_notifier(&info->power_supply_notifier);
-#endif
-
 ProbeErrorExit_5_1:
-	if (skip_5_1 != 1)
-		input_free_device(info->input_dev);
-
 ProbeErrorExit_5:
-	destroy_workqueue(info->event_wq);
-	destroy_workqueue(info->fps_wq);
-
 ProbeErrorExit_4:
-	fts_gpio_setup(info->board->irq_gpio, false, 0, 0);
-	fts_gpio_setup(info->board->reset_gpio, false, 0, 0);
-
 ProbeErrorExit_3_1:
-	fts_enable_reg(info, false);
-
 ProbeErrorExit_3:
-	fts_get_reg(info, false);
-
 ProbeErrorExit_2:
-	if (info->ts_pinctrl)
-		devm_pinctrl_put(info->ts_pinctrl);
-
 ProbeErrorExit_1:
-	kfree(info);
+	fts_release_resources(info);
 
 ProbeErrorExit_0:
 	logError(1, "%s Probe Failed!\n", tag);
@@ -7730,63 +7924,8 @@ static int fts_remove(struct spi_device *client)
 
 	struct fts_ts_info *info = dev_get_drvdata(&(client->dev));
 
-	fts_proc_remove();
-	if (info->tp_lockdown_info_proc)
-		remove_proc_entry(FTS_TP_LOCKDOWN_INFO_NAME, NULL);
-	if (info->tp_selftest_proc)
-		remove_proc_entry(FTS_TP_SELFTEST_NAME, NULL);
-	if (info->tp_data_dump_proc)
-		remove_proc_entry(FTS_TP_DATA_DUMP_NAME, NULL);
-	if (info->tp_fw_version_proc)
-		remove_proc_entry(FTS_TP_FW_VERSION_NAME, NULL);
-	info->tp_lockdown_info_proc = NULL;
-	info->tp_selftest_proc = NULL;
-	info->tp_data_dump_proc = NULL;
-	info->tp_fw_version_proc = NULL;
-
-	unregister_xiaomi_touch_client(TOUCH_ID_PRIMARY);
-
-	/* sysfs stuff */
-	sysfs_remove_group(&client->dev.kobj, &info->attrs);
-	/* remove interrupt and event handlers */
-	fts_interrupt_uninstall(info);
-#ifdef CONFIG_FTS_BL_CB
-	backlight_unregister_notifier(&info->bl_notifier);
-#endif
-#if defined(CONFIG_DRM)
-	if (active_panel && info->notifier_cookie)
-		panel_event_notifier_unregister(info->notifier_cookie);
-#endif
-	/* unregister the device */
-	input_unregister_device(info->input_dev);
-
-	/* Remove the work thread */
-	destroy_workqueue(info->event_wq);
-	destroy_workqueue(info->fps_wq);
-#ifndef FW_UPDATE_ON_PROBE
-	destroy_workqueue(info->fwu_workqueue);
-#endif
-#ifdef FTS_XIAOMI_TOUCHFEATURE
-	destroy_workqueue(info->touch_feature_wq);
-#endif
-	device_destroy(info->fts_tp_class, DCHIP_ID_0);
-	/*
-	class_destroy(info->fts_tp_class);
-	info->fts_tp_class = NULL;
-*/
-	if (info->debugfs)
-		debugfs_remove(info->debugfs);
-
-	fts_enable_reg(info, false);
-	fts_get_reg(info, false);
-	fts_gpio_setup(info->board->irq_gpio, false, 0, 0);
-	fts_gpio_setup(info->board->reset_gpio, false, 0, 0);
-	fts_info = NULL;
-#ifdef CONFIG_SECURE_TOUCH
-	fts_secure_remove(info);
-#endif
-	/* free all */
-	kfree(info);
+	if (info)
+		fts_release_resources(info);
 
 	return OK;
 }

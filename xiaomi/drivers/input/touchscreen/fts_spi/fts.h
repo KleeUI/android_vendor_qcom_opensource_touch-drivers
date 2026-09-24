@@ -395,6 +395,9 @@ struct fts_ts_info {
 	struct notifier_block notifier;
 	struct notifier_block bl_notifier;
 	void *notifier_cookie;
+	struct drm_panel *panel;
+	struct mutex panel_notifier_lock;
+	unsigned int panel_notifier_retries;
 	bool sensor_sleep;
 	bool sensor_scan;
 	struct pinctrl *ts_pinctrl;
@@ -465,6 +468,18 @@ struct fts_ts_info {
 	struct notifier_block power_supply_notifier;
 	struct delayed_work panel_notifier_register_work;
 	bool probe_ok;
+	bool removing;
+	bool irq_registered;
+	bool input_registered;
+	bool regulators_enabled;
+	bool sysfs_registered;
+	bool proc_registered;
+	bool wakeup_enabled;
+	bool xiaomi_touch_registered;
+	bool power_supply_registered;
+	bool bl_registered;
+	bool irq_gpio_requested;
+	bool reset_gpio_requested;
 	struct mutex charge_lock;
 	int nonui_status;
 	bool gpio_has_request;
